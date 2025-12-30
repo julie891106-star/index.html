@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>雲端排隊系統 - 彈跳通知版</title>
+    <style>
+        :root { --primary: #3498db; --secondary: #2ecc71; --dark: #2c3e50; --bg: #f0f2f5; }
+        body { font-family: sans-serif; background: var(--bg); margin: 0; padding: 20px; display: flex; justify-content: center; }
+        .container { display: flex; gap: 20px; width: 100%; max-width: 1000px; flex-wrap: wrap; }
+        .main-panel { flex: 1.5; min-width: 350px; }
+        .side-panel { flex: 1.2; min-width: 320px; }
+        .card { background: white; padding: 25px; border-radius: 15px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); text-align: center; margin-bottom: 20px; border-top: 8px solid var(--primary); }
+        .current-name { font-size: 56px; font-weight: bold; color: var(--primary); margin: 10px 0; }
+        .current-note { color: #e67e22; font-style: italic; margin-bottom: 20px; font-size: 18px; }
+        
+        input[type="text"], textarea { width: 90%; padding: 12px; margin: 10px 0; border: 2px solid #ddd; border-radius: 8px; font-size: 16px; }
+        textarea { height: 60px; resize: none; font-family: inherit; }
+
+        .list-card { background: white; padding: 15px; border-radius: 15px; box-shadow: 0 5px 15px rgba(0,0,0,0.05); }
+        .list-item { padding: 12px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }
+        .list-info { flex: 1; text-align: left; }
+        .list-name { font-weight: bold; color: var(--dark); font-size: 18px; }
+        
+        .btn { padding: 12px; font-size: 16px; cursor: pointer; border: none; border-radius: 8px; color: white; font-weight: bold; }
+        .btn-primary { background: var(--primary); width: 100%; margin-top: 10px; }
+        .btn-success { background: var(--secondary); width: 100%; margin-bottom: 10px; }
+        .btn-danger { background: #95a5a6; font-size: 13px; width: 100%; margin-top: 10px; }
+        .btn-notify { background: #f39c12; width: 100%; margin-bottom: 15px; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <div class="main-panel">
+        <div class="card">
+            <button class="btn btn-notify" onclick="enableNotifications()">🔔 點我開啟叫號彈窗通知</button>
+            
+            <h1>正在請...</h1>
+            <div class="current-name" id="currentName">準備中</div>
+            <div class="current-note" id="currentNote">目前沒有備註</div>
+            <hr>
+            <h3>填寫排隊資料</h3>
+            <input type="text" id="userName" placeholder="您的姓名">
+            <textarea id="userNote" maxlength="100" placeholder="說明事項 (100字內)"></textarea>
+            <button class="btn btn-primary" onclick="takeTicket()">送出抽號</button>
+            <p id="myStatus" style="color: var(--secondary); font-weight: bold; margin-top: 10px;"></p>
+        </div>
+
+        <div class="card" style="border-top-color: var(--dark);">
+            <h3>主管控制台</h3>
+            <button class="btn btn-success" onclick="nextCall()">叫下一位 (按順序)</button>
+            <button class="btn btn-danger" onclick="resetQueue()">重設所有資料</button>
+        </div>
+    </div>
+
+    <div class="side-panel">
+        <div class="list-card">
+            <h3>等待名單 (主管可在此挑選)</h3>
+            <div id="queueListDisplay"></div>
+        </div>
+    </div>
+</div>
+
+<script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+    import { getDatabase, ref, set, onValue, push, remove, get } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-database.js";
+
+    const firebaseConfig = {
+        apiKey: "AIzaSyAFIj_ZvlYTNEF7Khhw8FWi60n6HGjOrqs",
+  authDomain: "waiting-c86c0.firebaseapp.com",
+  databaseURL: "https://waiting-c86c0-default-rtdb.firebaseio.com",
+  projectId: "waiting-c86c0",
+  storageBucket: "waiting-c86c0.firebasestorage.app",
+  messagingSenderId: "347647786746",
+  appId: "1:347647786746:web:047e649c81374ddefb1343",
+  measurementId: "G-4QXEQCC71L"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const db = getDatabase(app);
+
+    let myName = ""; // 紀錄目前這台手機主人的姓名
+
+    // 1. 開啟通知權限函式
+    window.enableNotifications = function() {
+        if (!("Notification" in window)) {
+            alert("此瀏覽器不支援彈窗通知");
+            return;
+        }
+        Notification.requestPermission().then(permission => {
+            if (permission === "granted") {
+                alert("通知權限已開啟！叫到您時會跳出彈窗。");
+            } else {
+                alert("您拒絕了通知，將無法收到彈窗提醒。");
+            }
+        });
+    };
+
+    // 2. 監聽資料
+    onValue(ref(db, '/'), (snapshot) => {
+        const data = snapshot.val() || {};
+        const current = data.status?.current || "無";
+        const currentNote = data.status?.note || "";
+        const queueEntries = data.queueList ? Object.entries(data.queueList) : [];
+
+        document.getElementById('currentName').innerText = current;
+        document.getElementById('currentNote').innerText = currentNote ? `備註：${currentNote}` : "目前沒有備註";
+
+        // 比對姓名，如果叫到的是自己，發送彈窗
+        if (myName !== "" && current === myName) {
+            sendPushNotification(current);
+            myName = ""; // 通知一次後重置，避免重複跳窗
+        }
+
+        const listDiv = document.getElementById('queueListDisplay');
+        listDiv.innerHTML = queueEntries.map(([key, val]) => `
+            <div class="list-item">
+                <div class="list-info">
+                    <div class="list-name">${val.name}</div>
+                    <div class="list-note">${val.note || '(無備註)'}</div>
+                </div>
+                <button class="btn" style="background:#f39c12; padding:6px 12px; font-size:14px;" onclick="pickUser('${key}', '${val.name}', '${val.note || ''}')">叫他</button>
+            </div>
+        `).join('') || '<p style="color:#999; text-align:center;">目前無人排隊</p>';
+    });
+
+    // 3. 發送彈窗通知
+    function sendPushNotification(name) {
+        if (Notification.permission === "granted") {
+            new Notification("叫號通知", {
+                body: `嘿！主管正在請 ${name} 過去喔！`,
+                icon: "https://cdn-icons-png.flaticon.com/512/1827/1827347.png" // 這裡可以換成你的圖示
+            });
+        }
+    }
+
+    window.takeTicket = function() {
+        const nameInput = document.getElementById('userName');
+        const noteInput = document.getElementById('userNote');
+        const name = nameInput.value.trim();
+        const note = noteInput.value.trim();
+        
+        if (!name) return alert("請輸入姓名");
+        
+        myName = name; // 記住自己的名字
+        push(ref(db, 'queueList'), { name: name, note: note, time: Date.now() });
+        
+        document.getElementById('myStatus').innerText = `已加入排隊：${name}`;
+        nameInput.value = "";
+        noteInput.value = "";
+    };
+
+    window.pickUser = function(key, name, note) {
+        set(ref(db, 'status'), { current: name, note: note });
+        remove(ref(db, `queueList/${key}`));
+    };
+
+    window.nextCall = function() {
+        get(ref(db, 'queueList')).then(snap => {
+            if (snap.exists()) {
+                const first = Object.entries(snap.val())[0];
+                pickUser(first[0], first[1].name, first[1].note);
+            } else {
+                alert("名單已空");
+            }
+        });
+    };
+
+    window.resetQueue = function() {
+        if(confirm("確定清除資料？")) {
+            set(ref(db, 'queueList'), null);
+            set(ref(db, 'status'), { current: "準備中", note: "" });
+        }
+    };
+</script>
+</body>
+</html>
